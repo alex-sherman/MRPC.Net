@@ -1,20 +1,30 @@
 ﻿using Replicate.MetaData;
 using Replicate.Serialization;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading.Tasks;
 
 namespace MRPC.Net {
     public class Client {
-        private Guid uuid;
+        public readonly Guid UUID = Guid.NewGuid();
         private int nextId = 0xFAFF;
-        private Dictionary<int, TaskCompletionSource<Response>> outstanding =
-            new Dictionary<int, TaskCompletionSource<Response>>();
+        private int port;
+        private ConcurrentDictionary<int, TaskCompletionSource<Response>> outstanding =
+            new ConcurrentDictionary<int, TaskCompletionSource<Response>>();
         private JSONSerializer serializer =
             new JSONSerializer(ReplicationModel.Default, new JSONSerializer.Configuration() { Strict = false });
-        private UdpClient udp = new UdpClient();
+        private UdpClient udp;
+
+        public Client(int port) {
+            this.port = port;
+            udp = new UdpClient(port);
+        }
+
+        public int GetNextId() { lock (this) return nextId++; }
 
         public void Listen() {
             Task.Run(async () => {
@@ -23,35 +33,35 @@ namespace MRPC.Net {
                     var receive = await udp.ReceiveAsync();
 
                     try {
+                        if (receive.RemoteEndPoint == udp.Client.LocalEndPoint) continue;
                         var response = serializer.Deserialize<Response>(receive.Buffer);
-                        lock (this) {
-                            if (!outstanding.ContainsKey(response.id)) continue;
-                            outstanding[response.id].TrySetResult(response);
-                            outstanding.Remove(response.id);
+                        if (!outstanding.TryRemove(response.id, out var source)) {
+                            continue;
                         }
-                    } catch (Replicate.SerializationError) {
+                        source.TrySetResult(response);
+                    } catch (Exception e) {
                         // TODO: Log
+                        // TODO: This gets hit on requests as well since path dsts don't parse as Guids
                     }
                 }
             });
         }
         public Task<Response> Call(Request request) {
             var resultSource = new TaskCompletionSource<Response>();
-            lock (this) {
-                outstanding[request.id] = resultSource;
-            }
+            if (!outstanding.TryAdd(request.id, resultSource))
+                throw new Exception("Failed to create request");
 
             var bytes = serializer.SerializeBytes(request);
-            udp.Send(bytes, bytes.Length);
+            udp.Send(bytes, bytes.Length, new IPEndPoint(IPAddress.Parse("192.168.1.255"), port));
 
             return resultSource.Task;
         }
 
         public async Task<TResult> Call<TResult, TValue>(string path, TValue value) {
             var request = new Request() {
-                id = nextId++,
+                id = GetNextId(),
                 dst = path,
-                src = uuid,
+                src = UUID,
                 value = Blob.FromString(serializer.SerializeString(value)),
             };
             var response = await Call(request);
