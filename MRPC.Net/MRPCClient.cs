@@ -89,6 +89,7 @@ namespace MRPC {
             this.timeout = timeout;
             this.retryDelay = retryDelay;
             udp = new UdpClient(port);
+            udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Broadcast, true);
         }
 
         public int GetNextId() { lock (this) return nextId++; }
