@@ -47,7 +47,7 @@ namespace MRPC {
                 return;
             }
             lock (client.udp) {
-                client.udp.Send(bytes, bytes.Length, new IPEndPoint(IPAddress.Parse("192.168.1.255"), client.port));
+                client.udp.Send(bytes, bytes.Length, new IPEndPoint(client.broadcast, client.port));
                 foreach (var missing in RemainingNodes) {
                     client.udp.Send(bytes, bytes.Length, new IPEndPoint(missing, client.port));
                 }
@@ -81,8 +81,10 @@ namespace MRPC {
             new JSONSerializer(ReplicationModel.Default, new JSONSerializer.Configuration() { Strict = false });
         internal UdpClient udp;
         internal PathCache pathCache = new PathCache();
-        public MRPCClient(int port) : this(port, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(100)) { }
-        public MRPCClient(int port, TimeSpan timeout, TimeSpan retryDelay) {
+        internal IPAddress broadcast;
+        public MRPCClient(string broadcastAddress, int port) : this(broadcastAddress, port, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(100)) { }
+        public MRPCClient(string broadcastAddress, int port, TimeSpan timeout, TimeSpan retryDelay) {
+            broadcast = IPAddress.Parse(broadcastAddress);
             this.port = port;
             this.timeout = timeout;
             this.retryDelay = retryDelay;
