@@ -22,101 +22,109 @@ namespace MRPC {
         int requestId;
         DateTime started;
         DateTime lastRetry;
+        bool setResponse = false;
         bool finished = false;
 
         public RequestContext(MRPCRequest request, MRPCClient client) {
             requestId = request.id;
             this.client = client;
-            bytes = client.serializer.SerializeBytes(request);
-            PathEntry = client.pathCache[request.dst];
+            bytes = client.Serializer.SerializeBytes(request);
+            PathEntry = client.PathCache[request.dst];
             RemainingNodes = new HashSet<IPAddress>(PathEntry.Nodes);
         }
         public void Start() {
             started = Util.Now;
+            SendTo(client.Broadcast);
             RetryRemaining();
         }
         public void Poll() {
-            if (Util.Now - started > client.timeout) Finish();
-            if (Util.Now - lastRetry > client.retryDelay) RetryRemaining();
+            if (Util.Now - started > client.Timeout) Finish();
+            if (!setResponse && Util.Now - lastRetry > client.RetryDelay) RetryRemaining();
         }
-        public void RetryRemaining() {
+        void RetryRemaining() {
             lastRetry = Util.Now;
-            // Only finish if we get at least a single response, otherwise wait for timeout.
+            // We can return early if we got all the reponses we expected, and got at least 1 response.
+            // Note that we don't finish here, and instead leave the context outstanding for the full timeout.
             if (!RemainingNodes.Any() && Responses.Any()) {
-                Finish();
+                SetResponse();
                 return;
             }
-            lock (client.udp) {
-                client.udp.Send(bytes, bytes.Length, new IPEndPoint(client.broadcast, client.port));
-                foreach (var missing in RemainingNodes) {
-                    client.udp.Send(bytes, bytes.Length, new IPEndPoint(missing, client.port));
-                }
+            lock (client.Udp) {
+                foreach (var missing in RemainingNodes)
+                    SendTo(missing);
             }
+        }
+        void SendTo(IPAddress remote) {
+            client.Udp.Send(bytes, bytes.Length, new IPEndPoint(remote, client.Port));
         }
         public void OnResponse(IPAddress remote, MRPCResponse response) {
             PathEntry.MarkSuccess(remote);
             Responses.Add(response);
             RemainingNodes.Remove(remote);
-            if (!RemainingNodes.Any()) Finish();
+            if (!RemainingNodes.Any()) SetResponse();
         }
-        public void Finish() {
+        void SetResponse() {
+            if (setResponse) return;
+            setResponse = true;
+            Source.SetResult(Responses);
+        }
+        void Finish() {
             if (finished) return;
             finished = true;
+            SetResponse();
             foreach (var missing in RemainingNodes) {
                 PathEntry.MarkError(missing);
             }
-            Source.SetResult(Responses);
-            client.outstanding.TryRemove(requestId, out var _);
+            client.Outstanding.TryRemove(requestId, out var _);
         }
     }
     public class MRPCClient {
         public readonly Guid UUID = Guid.NewGuid();
-        private int nextId = 0xFAFF;
-        internal int port;
-        internal TimeSpan timeout;
-        internal TimeSpan retryDelay;
-        internal ConcurrentDictionary<int, RequestContext> outstanding =
+        private int NextId = 0xFAFF;
+        internal int Port;
+        internal TimeSpan Timeout;
+        internal TimeSpan RetryDelay;
+        internal ConcurrentDictionary<int, RequestContext> Outstanding =
             new ConcurrentDictionary<int, RequestContext>();
-        internal JSONSerializer serializer =
+        internal JSONSerializer Serializer =
             new JSONSerializer(ReplicationModel.Default, new JSONSerializer.Configuration() { Strict = false });
-        internal UdpClient udp;
-        internal PathCache pathCache = new PathCache();
-        internal IPAddress broadcast;
+        internal UdpClient Udp;
+        internal PathCache PathCache = new PathCache();
+        internal IPAddress Broadcast;
         public MRPCClient(string broadcastAddress, int port) : this(broadcastAddress, port, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(100)) { }
         public MRPCClient(string broadcastAddress, int port, TimeSpan timeout, TimeSpan retryDelay) {
-            broadcast = IPAddress.Parse(broadcastAddress);
-            this.port = port;
-            this.timeout = timeout;
-            this.retryDelay = retryDelay;
-            udp = new UdpClient(port);
-            udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Broadcast, true);
+            Broadcast = IPAddress.Parse(broadcastAddress);
+            Port = port;
+            Timeout = timeout;
+            RetryDelay = retryDelay;
+            Udp = new UdpClient(port);
+            Udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Broadcast, true);
         }
 
-        public int GetNextId() { lock (this) return nextId++; }
+        public int GetNextId() { lock (this) return NextId++; }
 
         public void Listen() {
             Task.Run(async () => {
                 while (true) {
                     bool didWork = false;
-                    if (udp.Available > 0) {
+                    if (Udp.Available > 0) {
                         didWork = true;
                         // This will throw if the socket is closed
-                        var receive = await udp.ReceiveAsync();
+                        var receive = await Udp.ReceiveAsync();
 
                         try {
-                            if (receive.RemoteEndPoint == udp.Client.LocalEndPoint) continue;
-                            var response = serializer.Deserialize<MRPCResponse>(receive.Buffer);
-                            if (!outstanding.TryGetValue(response.id, out var source)) {
+                            if (receive.RemoteEndPoint == Udp.Client.LocalEndPoint) continue;
+                            var response = Serializer.Deserialize<MRPCResponse>(receive.Buffer);
+                            if (!Outstanding.TryGetValue(response.id, out var source)) {
                                 continue;
                             }
                             source.OnResponse(receive.RemoteEndPoint.Address, response);
                         } catch (Exception e) {
-                            // TODO: Log
                             // TODO: This gets hit on requests as well since path dsts don't parse as Guids
                         }
                     }
-                    var contexts = outstanding.Values.ToArray();
-                    foreach(var context in contexts) context.Poll();
+                    var contexts = Outstanding.Values.ToArray();
+                    foreach (var context in contexts) context.Poll();
                     if (didWork) continue;
                     await Task.Delay(10);
                 }
@@ -125,7 +133,7 @@ namespace MRPC {
 
         public Task<List<MRPCResponse>> Call(MRPCRequest request) {
             var requestContext = new RequestContext(request, this);
-            if (!outstanding.TryAdd(request.id, requestContext))
+            if (!Outstanding.TryAdd(request.id, requestContext))
                 throw new Exception("Failed to create request");
             requestContext.Start();
             return requestContext.ResponseTask;
@@ -137,12 +145,12 @@ namespace MRPC {
                 id = GetNextId(),
                 dst = path,
                 src = UUID,
-                value = Blob.FromString(serializer.SerializeString(value)),
+                value = Blob.FromString(Serializer.SerializeString(value)),
             };
             var response = (await Call(request)).FirstOrDefault();
             if (response == null) throw new TimeoutException();
             if (response.error != null) throw new Exception(response.error.ReadString());
-            return serializer.Deserialize<TResult>(response.result.Stream);
+            return Serializer.Deserialize<TResult>(response.result.Stream);
         }
     }
 }

@@ -12,6 +12,7 @@ namespace MRPC {
         public List<IPAddress> Nodes { get { lock (this) return nodes.Keys.ToList(); } }
         public void MarkError(IPAddress node) {
             lock (this) {
+                Console.WriteLine($"Error: {node}");
                 int value = 0;
                 nodes.TryGetValue(node, out value);
                 nodes[node] = value++;
